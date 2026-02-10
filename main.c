@@ -131,10 +131,10 @@ ModelMapping MODEL_SYSFS_MAP[] = {
     // For Raspberry Pi 5 Model B
     {
         // PWM chip #
-        2,
+        0,
 
         // GPIO PWM map
-        { {18, 0}, {19, 1}, {12, 2}, {13, 3} },
+        { {18, 2}, {19, 3}, {12, 0}, {13, 1} },
 
         // GPIO map
         {
@@ -158,9 +158,14 @@ short rpi_model = -1;
 // ENV CONFIG - Declare configuration variables w/expected type
 unsigned short BCM_GPIO_PIN_PWM = 18,
                PWM_FREQ_HZ      = 2500,
-               MIN_DUTY_CYCLE   = 20,
+               MIN_DUTY_CYCLE   = 30,
                MAX_DUTY_CYCLE   = 100,
                FAN_OFF_GRACE_MS = 60000;
+
+// Optional overrides for PWM chip/channel (useful for Pi 5 mapping differences)
+// - Defaults to 0xFFFF meaning "unset"
+unsigned short PWM_CHIP_OVERRIDE    = 0xFFFF;
+unsigned short PWM_CHANNEL_OVERRIDE = 0xFFFF;
 
 // ENV CONFIG - Time to sleep in main loop
 unsigned int SLEEP_MS = 250;
@@ -182,12 +187,18 @@ bool is_setup = false;
 // Is tachometer enabled?
 bool is_tach_enabled = false;
 
+// Is tachometer failsafe enabled?
+bool tach_failsafe_enabled = false;
+
 // Calculate the PWM duty cycle period in nano-seconds
 unsigned int pwm_duty_cycle_period_ns;
 
 // Keep chip number and channel number in broad scope for clean-up
 unsigned short pwm_chip_num;
 unsigned short pwm_channel_num;
+
+// Track whether the fan is currently considered "on" for hysteresis behavior
+bool fan_is_on = false;
 
 // File descriptors for control through /sys/class
 FILE *fd_pwm_chip_export                   = NULL;
@@ -213,10 +224,29 @@ volatile sig_atomic_t halt_received = 0;
 unsigned short bcm_gpio_pin_tach,
                tach_pulse_per_rev;
 
+// Tachometer failsafe config
+unsigned short TACH_START_DUTY = 60;
+unsigned int TACH_START_TIMEOUT_MS = 2000;
+unsigned int TACH_START_PULSE_MS = 1500;
+unsigned int TACH_COOLDOWN_MS = 10000;
+
 // Track tachometer (only enabled during debug)
 // - RPM as volatile since it will be referenced from multiple threads
 volatile unsigned short tach_rpm = 0;
 struct timeval tach_last_fall_epoch;
+
+// Track last time we initiated a start attempt / cooldown
+struct timeval tach_start_attempt_epoch;
+struct timeval tach_cooldown_epoch;
+
+// Failsafe state
+typedef enum {
+    TACH_STATE_OK = 0,
+    TACH_STATE_STARTING = 1,
+    TACH_STATE_COOLDOWN = 2
+} TachFailState;
+
+TachFailState tach_fail_state = TACH_STATE_OK;
 
 // True GPIO tachometer GPIO # from /sys/kernel/debug/gpio
 unsigned short gpio_true_tach_num;
@@ -612,6 +642,15 @@ void pwm_setup() {
     pwm_chip_num = get_gpio_sysfs_num( LOOKUP_PWM_CHIP, -1 );
     pwm_channel_num = get_gpio_sysfs_num( LOOKUP_GPIO_PWM_CHANNEL, BCM_GPIO_PIN_PWM );
 
+    // Optional overrides (useful for Pi 5 mapping differences)
+    if( PWM_CHIP_OVERRIDE != 0xFFFF ) {
+        pwm_chip_num = PWM_CHIP_OVERRIDE;
+    }
+
+    if( PWM_CHANNEL_OVERRIDE != 0xFFFF ) {
+        pwm_channel_num = PWM_CHANNEL_OVERRIDE;
+    }
+
     // Format to paths for /sys/class control
     char pwm_chip_path_str[32];
     char pwm_channel_path_str[48];
@@ -793,6 +832,20 @@ void on_tach_pull_down() {
     tach_rpm = round( ( 1000.0 / delta_time_ms ) / tach_pulse_per_rev * 60 );
 
     pthread_mutex_unlock( &mutex_tach_rpm );
+}
+
+// Milliseconds between two timeval structs (a - b)
+static inline float ms_since( struct timeval *a, struct timeval *b ) {
+    return ( a->tv_sec - b->tv_sec ) * 1000.0f + ( a->tv_usec - b->tv_usec ) / 1000.0f;
+}
+
+// Read RPM in a threadsafe way
+unsigned short get_tach_rpm() {
+    unsigned short rpm;
+    pthread_mutex_lock( &mutex_tach_rpm );
+    rpm = tach_rpm;
+    pthread_mutex_unlock( &mutex_tach_rpm );
+    return rpm;
 }
 
 // Setup the GPIO polling interrupt for the tachomter using the true GPIO number
@@ -1016,7 +1069,7 @@ int main( int argc, char* argv[] ) {
         csv_debug_logging_enabled = true;
     }
 
-    // Check if the required number of arguments is provided if using tachometer
+    // Check for tachometer args if provided
     if( argc > 2 && argc != 4 ) {
 
         l( ERROR, "Error: Incorrect number of arguments.\n" );
@@ -1039,9 +1092,31 @@ int main( int argc, char* argv[] ) {
     if( getenv( "PWM_FAN_MAX_DUTY_CYCLE" ) )   sscanf( getenv( "PWM_FAN_MAX_DUTY_CYCLE" ),   "%hu", &MAX_DUTY_CYCLE );
     if( getenv( "PWM_FAN_FAN_OFF_GRACE_MS" ) ) sscanf( getenv( "PWM_FAN_FAN_OFF_GRACE_MS" ), "%hu", &FAN_OFF_GRACE_MS );
     if( getenv( "PWM_FAN_SLEEP_MS" ) )         sscanf( getenv( "PWM_FAN_SLEEP_MS" ),         "%i",  &SLEEP_MS );
-    if( getenv( "PWM_FAN_MIN_OFF_TEMP_C" ) )   sscanf( getenv( "PWM_FAN_MIN_OFF_TEMP_C" ),   "%f",  &MIN_OFF_TEMP_C );
+    bool min_off_temp_set = false;
+    if( getenv( "PWM_FAN_MIN_OFF_TEMP_C" ) ) {
+        sscanf( getenv( "PWM_FAN_MIN_OFF_TEMP_C" ), "%f", &MIN_OFF_TEMP_C );
+        min_off_temp_set = true;
+    }
     if( getenv( "PWM_FAN_MIN_ON_TEMP_C" ) )    sscanf( getenv( "PWM_FAN_MIN_ON_TEMP_C" ),    "%f",  &MIN_ON_TEMP_C );
     if( getenv( "PWM_FAN_MAX_TEMP_C" ) )       sscanf( getenv( "PWM_FAN_MAX_TEMP_C" ),       "%f",  &MAX_TEMP_C );
+    if( getenv( "PWM_FAN_PWM_CHIP" ) )         sscanf( getenv( "PWM_FAN_PWM_CHIP" ),         "%hu", &PWM_CHIP_OVERRIDE );
+    if( getenv( "PWM_FAN_PWM_CHANNEL" ) )      sscanf( getenv( "PWM_FAN_PWM_CHANNEL" ),      "%hu", &PWM_CHANNEL_OVERRIDE );
+    if( getenv( "PWM_FAN_TACH_GPIO" ) )        sscanf( getenv( "PWM_FAN_TACH_GPIO" ),        "%hu", &bcm_gpio_pin_tach );
+    if( getenv( "PWM_FAN_TACH_PPR" ) )         sscanf( getenv( "PWM_FAN_TACH_PPR" ),         "%hu", &tach_pulse_per_rev );
+    if( getenv( "PWM_FAN_TACH_FAILSAFE" ) ) {
+        int tmp = 0;
+        sscanf( getenv( "PWM_FAN_TACH_FAILSAFE" ), "%i", &tmp );
+        tach_failsafe_enabled = tmp != 0;
+    }
+    if( getenv( "PWM_FAN_TACH_START_DUTY" ) )        sscanf( getenv( "PWM_FAN_TACH_START_DUTY" ),        "%hu", &TACH_START_DUTY );
+    if( getenv( "PWM_FAN_TACH_START_TIMEOUT_MS" ) )  sscanf( getenv( "PWM_FAN_TACH_START_TIMEOUT_MS" ),  "%u",  &TACH_START_TIMEOUT_MS );
+    if( getenv( "PWM_FAN_TACH_START_PULSE_MS" ) )    sscanf( getenv( "PWM_FAN_TACH_START_PULSE_MS" ),    "%u",  &TACH_START_PULSE_MS );
+    if( getenv( "PWM_FAN_TACH_COOLDOWN_MS" ) )       sscanf( getenv( "PWM_FAN_TACH_COOLDOWN_MS" ),       "%u",  &TACH_COOLDOWN_MS );
+
+    // Default MIN_OFF_TEMP_C to 5C below MIN_ON_TEMP_C if not explicitly set
+    if( ! min_off_temp_set ) {
+        MIN_OFF_TEMP_C = MIN_ON_TEMP_C - 5.0f;
+    }
 
     l( DEBUG, "\nConfig:\n" );
     l( DEBUG, " - BCM_GPIO_PIN_PWM = %i\n", BCM_GPIO_PIN_PWM );
@@ -1053,6 +1128,17 @@ int main( int argc, char* argv[] ) {
     l( DEBUG, " - MAX_TEMP_C       = %f\n", MAX_TEMP_C );
     l( DEBUG, " - FAN_OFF_GRACE_MS = %i\n", FAN_OFF_GRACE_MS );
     l( DEBUG, " - SLEEP_MS         = %i\n", SLEEP_MS );
+    if( PWM_CHIP_OVERRIDE != 0xFFFF )    { l( DEBUG, " - PWM_CHIP_OVERRIDE    = %i\n", PWM_CHIP_OVERRIDE ); }
+    if( PWM_CHANNEL_OVERRIDE != 0xFFFF ) { l( DEBUG, " - PWM_CHANNEL_OVERRIDE = %i\n", PWM_CHANNEL_OVERRIDE ); }
+    if( getenv( "PWM_FAN_TACH_GPIO" ) )  { l( DEBUG, " - TACH_GPIO           = %i\n", bcm_gpio_pin_tach ); }
+    if( getenv( "PWM_FAN_TACH_PPR" ) )   { l( DEBUG, " - TACH_PPR            = %i\n", tach_pulse_per_rev ); }
+    if( tach_failsafe_enabled ) {
+        l( DEBUG, " - TACH_FAILSAFE      = enabled\n" );
+        l( DEBUG, " - TACH_START_DUTY    = %i\n", TACH_START_DUTY );
+        l( DEBUG, " - TACH_START_TIMEOUT_MS = %u\n", TACH_START_TIMEOUT_MS );
+        l( DEBUG, " - TACH_START_PULSE_MS   = %u\n", TACH_START_PULSE_MS );
+        l( DEBUG, " - TACH_COOLDOWN_MS      = %u\n", TACH_COOLDOWN_MS );
+    }
     l( DEBUG, "\n" );
 
     for( int i = 0; i < CPU_TEMP_SMOOTH_ARR_SIZE; i++ ) { cpu_temp_smooth_arr[i] = MAX_TEMP_C; }
@@ -1083,14 +1169,27 @@ int main( int argc, char* argv[] ) {
     // Setup the PWM interface for controlling the fan speed
     pwm_setup();
 
+    // Enable tachometer from env or CLI
+    if( getenv( "PWM_FAN_TACH_GPIO" ) && getenv( "PWM_FAN_TACH_PPR" ) ) {
+
+        is_tach_enabled = true;
+    }
+
     if( is_tach_enabled ) {
 
         l( INFO, "Starting tachometer...\n" );
 
-        bcm_gpio_pin_tach  = ( unsigned short ) strtoul( argv[2], NULL, 10 );
-        tach_pulse_per_rev = ( unsigned short ) strtoul( argv[3], NULL, 10 );
+        if( argc == 4 ) {
+            bcm_gpio_pin_tach  = ( unsigned short ) strtoul( argv[2], NULL, 10 );
+            tach_pulse_per_rev = ( unsigned short ) strtoul( argv[3], NULL, 10 );
+        }
 
         l( INFO, "Monitoring GPIO pin: %d, Pulses per revolution: %d\n", bcm_gpio_pin_tach, tach_pulse_per_rev );
+
+        // Initialize timing baselines
+        gettimeofday( &tach_last_fall_epoch, NULL );
+        gettimeofday( &tach_start_attempt_epoch, NULL );
+        gettimeofday( &tach_cooldown_epoch, NULL );
 
         tach_gpio_setup();
         tach_polling_setup();
@@ -1111,7 +1210,6 @@ int main( int argc, char* argv[] ) {
     struct timeval cur_epoch;
     unsigned short duty_cycle_set_val;
     float cur_temp_c;
-    float use_min_temp_c;
     float grace_check_ms;
     unsigned short decided_mode_int;
 
@@ -1133,46 +1231,115 @@ int main( int argc, char* argv[] ) {
         // Push temp to
 
         duty_cycle_set_val = 0;
-        use_min_temp_c     = MIN_ON_TEMP_C;
-
-        // If we're above min off temp then set last_above_min_epoch
-        if( cur_temp_c > use_min_temp_c ) {
-
+        // If we're above min on temp then set last_above_min_epoch
+        if( cur_temp_c > MIN_ON_TEMP_C ) {
             gettimeofday( &last_above_min_epoch, NULL );
+            fan_is_on = true;
         }
 
         gettimeofday( &cur_epoch, NULL );
 
         grace_check_ms = ( cur_epoch.tv_sec - last_above_min_epoch.tv_sec ) * 1000.0f + ( cur_epoch.tv_usec - last_above_min_epoch.tv_usec ) / 1000.0f;
 
-        // If we're below min temp and within fan off grace period set to min duty cycle
-        if( cur_temp_c <= use_min_temp_c && grace_check_ms < FAN_OFF_GRACE_MS ) {
+        if( ! fan_is_on ) {
 
-            duty_cycle_set_val = MIN_DUTY_CYCLE;
-            decided_mode_int   = FAN_BELOW_MIN;
+            // Fan is off and below the on threshold: stay off
+            if( cur_temp_c < MIN_ON_TEMP_C ) {
 
-            l( DEBUG, CYAN "%.2f" RESET " BELOW_MIN use_min_temp_c - MIN_DUTY_CYCLE   ", cur_temp_c );
+                duty_cycle_set_val = 0;
+                decided_mode_int   = FAN_BELOW_OFF;
 
-        } else if( cur_temp_c <= use_min_temp_c ) {
+                l( DEBUG, GREEN "%.2f" RESET " BELOW_OFF MIN_ON_TEMP_C - OFF              ", cur_temp_c );
 
-            duty_cycle_set_val = 0;
-            decided_mode_int   = FAN_BELOW_OFF;
+            } else {
 
-            l( DEBUG, GREEN "%.2f" RESET " BELOW_OFF use_min_temp_c - OFF              ", cur_temp_c );
+                // Crossed the on threshold, allow normal control
+                fan_is_on = true;
+            }
+        }
 
-        } else if( cur_temp_c >= MAX_TEMP_C ) {
+        if( fan_is_on ) {
 
-            duty_cycle_set_val = MAX_DUTY_CYCLE;
-            decided_mode_int   = FAN_ABOVE_MAX;
+            // If we're below the off threshold and within grace period set to min duty cycle
+            if( cur_temp_c <= MIN_OFF_TEMP_C && grace_check_ms < FAN_OFF_GRACE_MS ) {
 
-            l( DEBUG, RED "%.2f" RESET " ABOVE_MAX MAX_TEMP_C - MAX_DUTY_CYCLE       ", cur_temp_c );
+                duty_cycle_set_val = MIN_DUTY_CYCLE;
+                decided_mode_int   = FAN_BELOW_MIN;
 
-        } else {
+                l( DEBUG, CYAN "%.2f" RESET " BELOW_MIN MIN_OFF_TEMP_C - MIN_DUTY_CYCLE   ", cur_temp_c );
 
-            duty_cycle_set_val = quartic_bezier_easing( get_cpu_temp_avg_c(), MIN_OFF_TEMP_C, MAX_TEMP_C, MIN_DUTY_CYCLE, MAX_DUTY_CYCLE );
-            decided_mode_int   = FAN_ABOVE_EAS;
+            } else if( cur_temp_c <= MIN_OFF_TEMP_C ) {
 
-            l( DEBUG, YELLOW "%.2f" RESET " ABOVE_EAS MAX_TEMP_C - quartic_bezier_easing", cur_temp_c );
+                duty_cycle_set_val = 0;
+                decided_mode_int   = FAN_BELOW_OFF;
+                fan_is_on          = false;
+
+                l( DEBUG, GREEN "%.2f" RESET " BELOW_OFF MIN_OFF_TEMP_C - OFF              ", cur_temp_c );
+
+            } else if( cur_temp_c >= MAX_TEMP_C ) {
+
+                duty_cycle_set_val = MAX_DUTY_CYCLE;
+                decided_mode_int   = FAN_ABOVE_MAX;
+
+                l( DEBUG, RED "%.2f" RESET " ABOVE_MAX MAX_TEMP_C - MAX_DUTY_CYCLE       ", cur_temp_c );
+
+            } else {
+
+                duty_cycle_set_val = quartic_bezier_easing( get_cpu_temp_avg_c(), MIN_OFF_TEMP_C, MAX_TEMP_C, MIN_DUTY_CYCLE, MAX_DUTY_CYCLE );
+                decided_mode_int   = FAN_ABOVE_EAS;
+
+                l( DEBUG, YELLOW "%.2f" RESET " ABOVE_EAS MAX_TEMP_C - quartic_bezier_easing", cur_temp_c );
+            }
+        }
+
+        // Tachometer failsafe logic
+        if( is_tach_enabled && tach_failsafe_enabled ) {
+
+            struct timeval now;
+            gettimeofday( &now, NULL );
+
+            unsigned short rpm = get_tach_rpm();
+            float ms_since_last_pulse = ms_since( &now, &tach_last_fall_epoch );
+
+            if( rpm > 0 ) {
+                tach_fail_state = TACH_STATE_OK;
+            }
+
+            if( tach_fail_state == TACH_STATE_OK ) {
+
+                if( duty_cycle_set_val > 0 && ms_since_last_pulse > TACH_START_TIMEOUT_MS ) {
+                    tach_fail_state = TACH_STATE_STARTING;
+                    gettimeofday( &tach_start_attempt_epoch, NULL );
+                }
+
+            } else if( tach_fail_state == TACH_STATE_STARTING ) {
+
+                // If we've been trying for too long, cut off and cooldown
+                if( ms_since( &now, &tach_start_attempt_epoch ) > TACH_START_PULSE_MS ) {
+                    if( ms_since_last_pulse > TACH_START_TIMEOUT_MS ) {
+                        tach_fail_state = TACH_STATE_COOLDOWN;
+                        gettimeofday( &tach_cooldown_epoch, NULL );
+                    } else {
+                        tach_fail_state = TACH_STATE_OK;
+                    }
+                }
+
+            } else if( tach_fail_state == TACH_STATE_COOLDOWN ) {
+
+                if( ms_since( &now, &tach_cooldown_epoch ) > TACH_COOLDOWN_MS ) {
+                    tach_fail_state = TACH_STATE_STARTING;
+                    gettimeofday( &tach_start_attempt_epoch, NULL );
+                }
+            }
+
+            // Override duty based on state
+            if( tach_fail_state == TACH_STATE_STARTING ) {
+                if( duty_cycle_set_val < TACH_START_DUTY ) {
+                    duty_cycle_set_val = TACH_START_DUTY;
+                }
+            } else if( tach_fail_state == TACH_STATE_COOLDOWN ) {
+                duty_cycle_set_val = 0;
+            }
         }
 
         pwm_set_duty_cycle( duty_cycle_set_val );
@@ -1193,9 +1360,7 @@ int main( int argc, char* argv[] ) {
 
         // Output tachometer if needed
         if( is_tach_enabled ) {
-
-            l( DEBUG, " - RPM = " CYAN "%i" RESET, tach_rpm );
-            tach_rpm = 0;
+            l( DEBUG, " - RPM = " CYAN "%i" RESET, get_tach_rpm() );
         }
 
         l( DEBUG, "\n" );
